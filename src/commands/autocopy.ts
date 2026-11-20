@@ -35,7 +35,8 @@ interface Config {
   allowedCoins: string[];         // empty = any
   blockedCoins: string[];
   copyCloses: boolean;
-  maxSignalAgeMinutes: number;    // only copy trades the trader opened within this many minutes
+  maxSignalAgeMinutes: number;    // backstop: never copy trades the trader opened longer ago than this
+  maxEntryDriftPct: number;       // skip while the coin price is more than this % better for the trader than their entry (moves against them are always fine)
   pollSeconds: number;
   logFile: string;
 }
@@ -54,7 +55,8 @@ const DEFAULTS: Config = {
   allowedCoins: [],
   blockedCoins: [],
   copyCloses: true,
-  maxSignalAgeMinutes: 10,
+  maxSignalAgeMinutes: 60,
+  maxEntryDriftPct: 1.5,
   pollSeconds: 5,
   logFile: 'autocopy.log',
 };
@@ -114,6 +116,7 @@ interface Signal {
   updateId?: string;
   portfolioId?: string;
   openedAt?: number;              // when the trader opened the trade
+  entryPrice?: number;            // trader's entry price
 }
 
 function parseSignal(post: any): Signal | null {
@@ -133,6 +136,7 @@ function parseSignal(post: any): Signal | null {
     updateId: u.id,
     portfolioId: u.portfolio?.id,
     openedAt: Number.isFinite(opened) ? opened : undefined,
+    entryPrice: Number(u.entryPrice) > 0 ? Number(u.entryPrice) : undefined,
   };
 }
 
@@ -144,7 +148,9 @@ async function refreshMeta() {
   meta = new Map((await hl.getMeta()).universe.map(a => [a.name, a]));
 }
 
-async function handleOpen(sig: Signal) {
+const driftNoted = new Set<string>();
+
+async function handleOpen(sig: Signal): Promise<'retry' | void> {
   const tag = `@${sig.username} ${sig.coin} ${sig.side} ${sig.leverage}x`;
   if (traderFilter.size && !traderFilter.has(norm(sig.username))) return log('INFO', `skip ${tag}: trader not in list`);
   if (allowed.size && !allowed.has(sig.coin)) return log('INFO', `skip ${tag}: coin not allowed`);
@@ -166,6 +172,18 @@ async function handleOpen(sig: Signal) {
   if (!cfg.dryRun && margin > withdrawable) return log('WARN', `skip ${tag}: need $${margin.toFixed(2)} margin, only $${withdrawable.toFixed(2)} available`);
 
   const mid = parseFloat((await hl.getAllMids())[sig.coin]);
+  if (sig.entryPrice) {
+    // + = price moved in the trader's favour (worse for us), - = against them (better entry for us)
+    const drift = ((sig.side === 'long' ? mid - sig.entryPrice : sig.entryPrice - mid) / sig.entryPrice) * 100;
+    if (drift > cfg.maxEntryDriftPct) {
+      if (!driftNoted.has(sig.baseShortId!)) {
+        driftNoted.add(sig.baseShortId!);
+        log('INFO', `waiting on ${tag}: price is ${drift.toFixed(2)}% past their entry ${sig.entryPrice} (limit ${cfg.maxEntryDriftPct}%) - will copy if it comes back`);
+      }
+      return 'retry';
+    }
+    log('INFO', `${tag}: price is ${drift >= 0 ? drift.toFixed(2) + '% past' : Math.abs(drift).toFixed(2) + '% better than'} their entry ${sig.entryPrice} - copying`);
+  }
   const size = hl.formatSz((margin * lev) / mid, asset.szDecimals);
   if (size * mid < 10) return log('WARN', `skip ${tag}: order $${(size * mid).toFixed(2)} below Hyperliquid's $10 minimum (raise margin or leverage)`);
 
@@ -316,6 +334,7 @@ async function main() {
   if (replay) log('INFO', 'REPLAY: treating open trades already in the feed as new (dry run preview)');
   const knownTrades = new Set<string>();
   const seenNotifications = new Set<string>();
+  const waiting = new Map<string, Signal>();   // trades waiting for the price to come back within maxEntryDriftPct
   let first = true;
   let loops = 0;
   let failures = 0;
@@ -331,9 +350,10 @@ async function main() {
     const desc = `@${sig.username} ${sig.coin} ${sig.side} ${sig.leverage}x`;
     if (!sig.isOpen) return log('INFO', `seen already-closed trade ${desc} - ignoring`);
     if (ageMin > cfg.maxSignalAgeMinutes) return log('INFO', `new post for an older trade ${desc} (opened ${Math.round(ageMin)} min ago) - not copying`);
-    log('INFO', `NEW TRADE via ${source}: ${desc} (opened ${ageMin.toFixed(1)} min ago)`);
+    if (!driftNoted.has(id)) log('INFO', `NEW TRADE via ${source}: ${desc} (opened ${ageMin.toFixed(1)} min ago)`);
     try {
-      await handleOpen(sig);
+      if ((await handleOpen(sig)) === 'retry') { knownTrades.delete(id); waiting.set(id, sig); return; }
+      waiting.delete(id);
       markHandled(id);
     } catch (e: any) {
       knownTrades.delete(id); // let the next poll retry while the trade is still fresh
@@ -343,6 +363,15 @@ async function main() {
 
   while (true) {
     try {
+      // 0) Re-check trades waiting for a better price
+      for (const [id, sig] of [...waiting]) {
+        const ageMin = sig.openedAt ? (Date.now() - sig.openedAt) / 60_000 : Infinity;
+        if (ageMin > cfg.maxSignalAgeMinutes) { waiting.delete(id); markHandled(id); log('INFO', `gave up on @${sig.username} ${sig.coin}: price never came back within ${cfg.maxEntryDriftPct}% in ${cfg.maxSignalAgeMinutes} min`); continue; }
+        const st = sig.baseId ? (await invo.getInvestmentStatus(sig.baseId).catch(() => null))?.status : null;
+        if (st && st.isOpen === false) { waiting.delete(id); markHandled(id); log('INFO', `@${sig.username} closed ${sig.coin} before the price came back - not copying`); continue; }
+        await consider(sig, 'retry');
+      }
+
       // 1) Notifications: instant, and include trades posted without a caption (hidden "shadow" posts)
       const notes: any[] = ((await invo.getNotifications(1, 20)).items ?? []).slice().reverse();
       for (const n of notes) {
