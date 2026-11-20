@@ -149,6 +149,7 @@ async function refreshMeta() {
 }
 
 const driftNoted = new Set<string>();
+const capacityNoted = new Set<string>();
 
 async function handleOpen(sig: Signal): Promise<'retry' | void> {
   const tag = `@${sig.username} ${sig.coin} ${sig.side} ${sig.leverage}x`;
@@ -156,7 +157,10 @@ async function handleOpen(sig: Signal): Promise<'retry' | void> {
   if (allowed.size && !allowed.has(sig.coin)) return log('INFO', `skip ${tag}: coin not allowed`);
   if (blocked.has(sig.coin)) return log('INFO', `skip ${tag}: coin blocked`);
   if (held[sig.coin]) return log('INFO', `skip ${tag}: already holding ${sig.coin}`);
-  if (Object.keys(held).length >= cfg.maxOpenPositions) return log('WARN', `skip ${tag}: max open positions (${cfg.maxOpenPositions}) reached`);
+  if (Object.keys(held).length >= cfg.maxOpenPositions) {
+    if (!capacityNoted.has(sig.baseShortId!)) { capacityNoted.add(sig.baseShortId!); log('WARN', `waiting on ${tag}: max open positions (${cfg.maxOpenPositions}) reached - will copy if a slot frees up`); }
+    return 'retry';
+  }
 
   const asset = meta.get(sig.coin);
   if (!asset) return log('WARN', `skip ${tag}: ${sig.coin} not listed on Hyperliquid perps`);
@@ -169,7 +173,10 @@ async function handleOpen(sig: Signal): Promise<'retry' | void> {
   const accountValue = parseFloat(acct.marginSummary?.accountValue ?? '0');
   const withdrawable = parseFloat(acct.withdrawable ?? '0');
   const margin = cfg.marginPerTradePct ? accountValue * cfg.marginPerTradePct / 100 : cfg.marginPerTradeUsd;
-  if (!cfg.dryRun && margin > withdrawable) return log('WARN', `skip ${tag}: need $${margin.toFixed(2)} margin, only $${withdrawable.toFixed(2)} available`);
+  if (!cfg.dryRun && margin > withdrawable) {
+    if (!capacityNoted.has(sig.baseShortId!)) { capacityNoted.add(sig.baseShortId!); log('WARN', `waiting on ${tag}: need $${margin.toFixed(2)} margin, only $${withdrawable.toFixed(2)} available - will copy if margin frees up`); }
+    return 'retry';
+  }
 
   const mid = parseFloat((await hl.getAllMids())[sig.coin]);
   if (sig.entryPrice) {
@@ -357,7 +364,7 @@ async function main() {
     const desc = `@${sig.username} ${sig.coin} ${sig.side} ${sig.leverage}x`;
     if (!sig.isOpen) return log('INFO', `seen already-closed trade ${desc} - ignoring`);
     if (ageMin > cfg.maxSignalAgeMinutes) return log('INFO', `new post for an older trade ${desc} (opened ${Math.round(ageMin)} min ago) - not copying`);
-    if (!driftNoted.has(id)) log('INFO', `NEW TRADE via ${source}: ${desc} (opened ${ageMin.toFixed(1)} min ago)`);
+    if (!driftNoted.has(id) && !capacityNoted.has(id)) log('INFO', `NEW TRADE via ${source}: ${desc} (opened ${ageMin.toFixed(1)} min ago)`);
     try {
       if ((await handleOpen(sig)) === 'retry') { knownTrades.delete(id); waiting.set(id, sig); return; }
       waiting.delete(id);
@@ -393,9 +400,9 @@ async function main() {
       // 0) Re-check trades waiting for a better price
       for (const [id, sig] of [...waiting]) {
         const ageMin = sig.openedAt ? (Date.now() - sig.openedAt) / 60_000 : Infinity;
-        if (ageMin > cfg.maxSignalAgeMinutes) { waiting.delete(id); markHandled(id); log('INFO', `gave up on @${sig.username} ${sig.coin}: price never came back within ${cfg.maxEntryDriftPct}% in ${cfg.maxSignalAgeMinutes} min`); continue; }
+        if (ageMin > cfg.maxSignalAgeMinutes) { waiting.delete(id); markHandled(id); log('INFO', `gave up on @${sig.username} ${sig.coin}: still not copyable after ${cfg.maxSignalAgeMinutes} min`); continue; }
         const st = sig.baseId ? (await invo.getInvestmentStatus(sig.baseId).catch(() => null))?.status : null;
-        if (st && st.isOpen === false) { waiting.delete(id); markHandled(id); log('INFO', `@${sig.username} closed ${sig.coin} before the price came back - not copying`); continue; }
+        if (st && st.isOpen === false) { waiting.delete(id); markHandled(id); log('INFO', `@${sig.username} closed ${sig.coin} while it was waiting - not copying`); continue; }
         await consider(sig, 'retry');
       }
 
