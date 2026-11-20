@@ -5,7 +5,9 @@ const INFO_URL = 'https://api.hyperliquid.xyz/info';
 // Invo's builder fee only works on accounts that approved it through Invo.
 // On your own Hyperliquid account it is off unless USE_INVO_BUILDER=true.
 const INVO_BUILDER = { address: '0x557edb253b1d7ed5f15b248a5a3fd919fa5d3c81', fee: 35 };
-const USE_BUILDER = process.env.USE_INVO_BUILDER === 'true';
+let useBuilder = process.env.USE_INVO_BUILDER === 'true';
+/** Invo-wallet mode: attach Invo's builder fee (already approved on Invo wallets). */
+export function setUseInvoBuilder(on: boolean) { useBuilder = on; }
 
 // SDK expects "SOL-PERP" format; REST API uses "SOL"
 function toSdkCoin(coin: string): string {
@@ -94,6 +96,7 @@ export async function placeMarketOrder(
   size: string,
   slippagePct = 0.02,
   reduceOnly = false,
+  cloid?: string,
 ) {
   const mids = await getAllMids();
   const mid = parseFloat(mids[coin]);
@@ -111,7 +114,8 @@ export async function placeMarketOrder(
     order_type: { limit: { tif: 'Ioc' } },
     reduce_only: reduceOnly,
     grouping: 'na',
-    ...(USE_BUILDER ? { builder: INVO_BUILDER } : {}),
+    ...(cloid ? { cloid } : {}),
+    ...(useBuilder ? { builder: INVO_BUILDER } : {}),
   } as any);
 }
 
@@ -142,7 +146,7 @@ export async function cancelOrdersForCoin(coin: string, wallet: string) {
   return s.exchange.cancelOrder(orders.map(o => ({ coin: toSdkCoin(coin), o: o.oid })));
 }
 
-export async function closePosition(coin: string, wallet: string) {
+export async function closePosition(coin: string, wallet: string, cloid?: string) {
   const positions = await getPositions(wallet);
   const pos = positions.find((p: any) => p.coin === coin);
   if (!pos) throw new Error(`No open position for ${coin}`);
@@ -151,7 +155,7 @@ export async function closePosition(coin: string, wallet: string) {
   const isLong = parseFloat(pos.szi) > 0;
 
   // Close = opposite direction, reduce-only so it can never open a reverse position
-  return placeMarketOrder(coin, !isLong, size.toString(), 0.02, true);
+  return placeMarketOrder(coin, !isLong, size.toString(), 0.02, true, cloid);
 }
 
 /** Pull fill info / error out of an order response. */

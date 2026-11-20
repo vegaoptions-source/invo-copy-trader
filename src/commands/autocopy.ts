@@ -13,14 +13,18 @@
  * "dryRun": false in the config.
  */
 import { existsSync, readFileSync, writeFileSync, appendFileSync } from 'fs';
-import { validateEnv, INVO_TOKEN, INVO_REFRESH_TOKEN, HL_AGENT_KEY, WALLET_ADDRESS } from '../env.js';
+import { INVO_TOKEN, INVO_REFRESH_TOKEN, HL_AGENT_KEY, WALLET_ADDRESS } from '../env.js';
 import * as invo from '../invo-client.js';
 import * as hl from '../hl-client.js';
+import { ensureAgent } from '../invo-agent.js';
+import { newInvoTx } from '../invo-ids.js';
 
 // ---------- config ----------
 
 interface Config {
   dryRun: boolean;
+  mode: 'invo' | 'hyperliquid';   // invo = trade your Invo wallet (key approved via Invo); hyperliquid = your own HL account + HL_AGENT_KEY
+  recordOnInvo: boolean;          // invo mode: record opens/closes on Invo so they show in the app
   marginPerTradeUsd: number;      // margin put into each copied trade
   marginPerTradePct: number | null; // if set, % of account value instead of fixed USD
   maxLeverage: number;            // trader's leverage is capped to this
@@ -37,6 +41,8 @@ interface Config {
 
 const DEFAULTS: Config = {
   dryRun: true,
+  mode: 'invo',
+  recordOnInvo: true,
   marginPerTradeUsd: 5,
   marginPerTradePct: null,
   maxLeverage: 10,
@@ -74,6 +80,7 @@ interface Held {
   ownerId: string;
   username: string;
   sourceBaseShortId?: string;
+  invoBaseShortId?: string;       // our own Invo position id, needed to record the close
   openedAt: string;
 }
 const statePath = cfg.dryRun ? 'autocopy-state.dry.json' : 'autocopy-state.json';
@@ -97,6 +104,9 @@ interface Signal {
   ownerId: string;
   username: string;
   baseShortId?: string;
+  baseId?: string;
+  updateId?: string;
+  portfolioId?: string;
   createdAt?: number;
 }
 
@@ -117,6 +127,9 @@ function parseSignal(post: any): Signal | null {
     ownerId: u.owner?.id ?? post.owner?.id ?? '',
     username: u.owner?.username ?? post.owner?.username ?? '?',
     baseShortId: u.baseShortId,
+    baseId: u.baseId,
+    updateId: u.id,
+    portfolioId: u.portfolio?.id,
     createdAt: Number.isFinite(created) ? created : undefined,
   };
 }
@@ -157,12 +170,37 @@ async function handleOpen(sig: Signal) {
   const slPx = slMove ? (isLong ? mid * (1 - slMove) : mid * (1 + slMove)) : 0;
   const plan = { coin: sig.coin, side: sig.side, size, leverage: lev, margin: +margin.toFixed(2), approxPx: mid, stopLoss: slPx ? +slPx.toPrecision(5) : null };
 
+  let invoBaseShortId: string | undefined;
   if (cfg.dryRun) {
     log('TRADE', `would OPEN copy of ${tag}`, plan);
   } else {
+    const invoMode = cfg.mode === 'invo';
+    const tx = invoMode ? newInvoTx('open') : undefined;
+    const posBefore = (await hl.getPositions(WALLET_ADDRESS)).find((p: any) => p.coin === sig.coin);
     await hl.setLeverage(sig.coin, lev);
-    const out = hl.orderOutcome(await hl.placeMarketOrder(sig.coin, isLong, String(size)));
+    const nonceMs = Date.now();
+    const resp = await hl.placeMarketOrder(sig.coin, isLong, String(size), 0.02, false, tx?.cloid);
+    const out = hl.orderOutcome(resp);
     if (!out.filled) return log('ERROR', `open failed for ${tag}`, out);
+    if (invoMode && cfg.recordOnInvo) {
+      // Best effort: the position is open on Hyperliquid either way.
+      try {
+        const rec = await invo.recordOpen({
+          clientTxId: tx!.clientTxId, coin: sig.coin, assetIndex: [...meta.keys()].indexOf(sig.coin),
+          entry: { side: sig.side, marginMode: 'isolated', leverage: lev, tpPx: null, slPx: null },
+          submission: { hlOrder: resp, nonceMs, hlResponse: resp },
+          summary: { qtyBefore: posBefore?.szi ?? '0', qtyAfter: String(isLong ? out.totalSz : -out.totalSz!), intendedLeverage: lev },
+          mimicMeta: {
+            portfolioId: sig.portfolioId ?? '', creatorInvoUserId: sig.ownerId,
+            initialSourcePaperUpdateId: sig.updateId ?? '', sourcePaperTradeBaseId: sig.baseId ?? '',
+          },
+        });
+        invoBaseShortId = rec?.data?.baseShortId ?? rec?.baseShortId;
+        log('INFO', `recorded open on Invo`, rec?.data ?? rec);
+      } catch (e: any) {
+        log('WARN', `could not record open on Invo (trade is still open on Hyperliquid): ${e.message}`);
+      }
+    }
     plan.size = out.totalSz!;
     plan.approxPx = out.avgPx!;
     if (slPx) {
@@ -175,7 +213,7 @@ async function handleOpen(sig: Signal) {
 
   held[sig.coin] = {
     coin: sig.coin, side: sig.side, size: plan.size, leverage: lev, entryPx: plan.approxPx,
-    ownerId: sig.ownerId, username: sig.username, sourceBaseShortId: sig.baseShortId,
+    ownerId: sig.ownerId, username: sig.username, sourceBaseShortId: sig.baseShortId, invoBaseShortId,
     openedAt: new Date().toISOString(),
   };
   saveState();
@@ -190,9 +228,20 @@ async function handleClose(sig: Signal) {
     log('TRADE', `would CLOSE ${sig.coin} (@${sig.username} closed)`);
   } else {
     try {
-      const out = hl.orderOutcome(await hl.closePosition(sig.coin, WALLET_ADDRESS));
+      const tx = cfg.mode === 'invo' ? newInvoTx('close') : undefined;
+      const nonceMs = Date.now();
+      const resp = await hl.closePosition(sig.coin, WALLET_ADDRESS, tx?.cloid);
+      const out = hl.orderOutcome(resp);
       if (!out.filled) return log('ERROR', `close failed for ${sig.coin} - will retry next signal/reconcile`, out);
       log('TRADE', `CLOSED ${sig.coin} (@${sig.username} closed)`, out);
+      if (tx && cfg.recordOnInvo && h.invoBaseShortId) {
+        await invo.recordClose({
+          clientTxId: tx.clientTxId, baseShortId: h.invoBaseShortId, assetIndex: [...meta.keys()].indexOf(sig.coin),
+          submission: { hlOrder: resp, nonceMs, hlResponse: resp },
+          summary: { qtyBefore: String(h.side === 'long' ? h.size : -h.size), qtyAfter: '0' },
+        }).then(r => log('INFO', 'recorded close on Invo', r?.data ?? r))
+          .catch((e: any) => log('WARN', `could not record close on Invo: ${e.message}`));
+      }
     } catch (e: any) {
       if (!/No open position/.test(e.message)) throw e;
       log('INFO', `${sig.coin} already closed on exchange`);
@@ -219,11 +268,23 @@ async function reconcile() {
 
 // ---------- main loop ----------
 
+async function connectTrading() {
+  if (cfg.mode === 'invo') {
+    hl.setUseInvoBuilder(true);
+    const key = await ensureAgent(WALLET_ADDRESS, m => log('INFO', m));
+    await hl.connect(key.privateKey, WALLET_ADDRESS);
+  } else {
+    if (!HL_AGENT_KEY) throw new Error('hyperliquid mode needs HL_AGENT_KEY');
+    await hl.connect(HL_AGENT_KEY, WALLET_ADDRESS);
+  }
+}
+
 async function main() {
-  validateEnv();
+  if (!INVO_REFRESH_TOKEN && !INVO_TOKEN) throw new Error('Missing INVO_REFRESH_TOKEN');
+  if (!WALLET_ADDRESS) throw new Error('Missing WALLET_ADDRESS (your Invo wallet address in invo mode)');
   if (INVO_TOKEN) invo.setToken(INVO_TOKEN);
   if (INVO_REFRESH_TOKEN) invo.setRefreshToken(INVO_REFRESH_TOKEN);
-  if (!cfg.dryRun) await hl.connect(HL_AGENT_KEY, WALLET_ADDRESS);
+  if (!cfg.dryRun) await connectTrading();
   await refreshMeta();
 
   log('INFO', 'autocopy started', { config: configPath, ...cfg, holding: Object.keys(held) });
@@ -264,6 +325,7 @@ async function main() {
 
       if (++loops % 12 === 0) await reconcile();          // ~every minute
       if (loops % 720 === 0) await refreshMeta();          // ~every hour
+      if (!cfg.dryRun && loops % 4320 === 0) await connectTrading(); // ~every 6h: renews the trading key before expiry
       if (seen.size > 5000) { const keep = [...seen].slice(-2000); seen.clear(); keep.forEach(k => seen.add(k)); }
     } catch (e: any) {
       failures++;

@@ -9,3 +9,4 @@ autocopy.log
 autocopy-state*.json
 copy-config.json
 patches/
+agent-key.json

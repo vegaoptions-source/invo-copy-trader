@@ -183,6 +183,18 @@ export async function recordClose(payload: RecordClosePayload) {
   return post('/dex/position/close', payload);
 }
 
+// --- Agent (trading key) approval: same flow the Invo web app uses ---
+
+/** Step 1: ask Invo for a message to sign for a new agent key in a slot. */
+export async function agentChallenge(slotName: string, address: string) {
+  return post('/dex/agent/challenge', { slotName, address });
+}
+
+/** Step 2: send the agent's signature; Invo then approves the agent on Hyperliquid. */
+export async function agentApprove(challengeId: string, signature: string) {
+  return post('/dex/agent/approve/wallet', { challengeId, signature });
+}
+
 export async function getInvestmentStatus(investmentBaseId: string) {
   return get(`/investment/status/${investmentBaseId}`);
 }
