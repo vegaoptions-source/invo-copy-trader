@@ -89,6 +89,9 @@ interface Held {
 const statePath = cfg.dryRun ? 'autocopy-state.dry.json' : 'autocopy-state.json';
 let held: Record<string, Held> = existsSync(statePath) ? JSON.parse(readFileSync(statePath, 'utf8')) : {};
 const saveState = () => writeFileSync(statePath, JSON.stringify(held, null, 2));
+const handledPath = cfg.dryRun ? 'autocopy-handled.dry.json' : 'autocopy-handled.json';
+const handled = new Set<string>(existsSync(handledPath) ? JSON.parse(readFileSync(handledPath, 'utf8')) : []);
+const markHandled = (id: string) => { handled.add(id); writeFileSync(handledPath, JSON.stringify([...handled].slice(-2000))); };
 
 function log(level: 'INFO' | 'WARN' | 'ERROR' | 'TRADE', msg: string, extra?: unknown) {
   const line = `${new Date().toISOString()} [${level}]${cfg.dryRun ? ' [DRY]' : ''} ${msg}${extra !== undefined ? ' ' + JSON.stringify(extra) : ''}`;
@@ -318,16 +321,24 @@ async function main() {
   let failures = 0;
 
   async function consider(sig: Signal, source: string) {
-    if (knownTrades.has(sig.baseShortId!)) return;
-    knownTrades.add(sig.baseShortId!);
-    // trades already known at startup are not copied (AUTOCOPY_REPLAY=1 previews them, dry run only)
-    if (first && !(replay && sig.isOpen)) return;
+    const id = sig.baseShortId!;
+    if (knownTrades.has(id)) return;
+    knownTrades.add(id);
+    if (handled.has(id) && !replay) return;           // already copied or deliberately skipped before
     const ageMin = replay ? 0 : sig.openedAt ? (Date.now() - sig.openedAt) / 60_000 : Infinity;
+    // At startup only catch up on trades opened within the window (missed during downtime); ignore older ones quietly
+    if (first && !replay && !(sig.isOpen && ageMin <= cfg.maxSignalAgeMinutes)) return;
     const desc = `@${sig.username} ${sig.coin} ${sig.side} ${sig.leverage}x`;
     if (!sig.isOpen) return log('INFO', `seen already-closed trade ${desc} - ignoring`);
     if (ageMin > cfg.maxSignalAgeMinutes) return log('INFO', `new post for an older trade ${desc} (opened ${Math.round(ageMin)} min ago) - not copying`);
     log('INFO', `NEW TRADE via ${source}: ${desc} (opened ${ageMin.toFixed(1)} min ago)`);
-    await handleOpen(sig);
+    try {
+      await handleOpen(sig);
+      markHandled(id);
+    } catch (e: any) {
+      knownTrades.delete(id); // let the next poll retry while the trade is still fresh
+      throw e;
+    }
   }
 
   while (true) {
@@ -338,7 +349,6 @@ async function main() {
         if (!n?.id || seenNotifications.has(n.id)) continue;
         seenNotifications.add(n.id);
         if (n.notificationType !== 'user_added_investment' || !n.postId) continue;
-        if (first && !replay) continue; // startup: just remember them
         try {
           const post = (await invo.getPostById(n.postId))?.post;
           const sig = parseSignal(post);

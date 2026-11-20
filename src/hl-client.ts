@@ -1,4 +1,4 @@
-import { Hyperliquid } from 'hyperliquid';
+import * as ex from './hl-exchange.js';
 
 const INFO_URL = 'https://api.hyperliquid.xyz/info';
 
@@ -9,26 +9,9 @@ let useBuilder = process.env.USE_INVO_BUILDER === 'true';
 /** Invo-wallet mode: attach Invo's builder fee (already approved on Invo wallets). */
 export function setUseInvoBuilder(on: boolean) { useBuilder = on; }
 
-// SDK expects "SOL-PERP" format; REST API uses "SOL"
-function toSdkCoin(coin: string): string {
-  return coin.includes('-') ? coin : `${coin}-PERP`;
-}
-
-let sdk: Hyperliquid | null = null;
-
-export async function connect(agentKey: string, walletAddress: string): Promise<Hyperliquid> {
-  sdk = new Hyperliquid({
-    privateKey: agentKey,
-    walletAddress,
-    enableWs: false,
-  });
-  await sdk.connect();
-  return sdk;
-}
-
-export function getSdk(): Hyperliquid {
-  if (!sdk) throw new Error('HL SDK not connected. Call connect() first.');
-  return sdk;
+/** Set the agent key used to sign orders (no network call). */
+export async function connect(agentKey: string, _walletAddress: string): Promise<void> {
+  ex.setAgentKey(agentKey);
 }
 
 async function info<T = any>(body: object): Promise<T> {
@@ -78,16 +61,18 @@ export function formatSz(sz: number, szDecimals: number): number {
   return Math.floor(sz * f) / f;
 }
 
-async function szDecimalsFor(coin: string): Promise<number> {
+async function assetInfo(coin: string): Promise<{ index: number; szDecimals: number }> {
   const meta = await getMeta();
-  const a = meta.universe.find(u => u.name === coin);
-  if (!a) throw new Error(`Unknown coin: ${coin}`);
-  return a.szDecimals;
+  const index = meta.universe.findIndex(u => u.name === coin);
+  if (index < 0) throw new Error(`Unknown coin: ${coin}`);
+  return { index, szDecimals: meta.universe[index].szDecimals };
 }
 
 export async function setLeverage(coin: string, leverage: number) {
-  const s = getSdk();
-  return s.exchange.updateLeverage(toSdkCoin(coin), 'isolated', leverage);
+  const { index } = await assetInfo(coin);
+  const r = await ex.updateLeverage(index, leverage, false);
+  if (r?.status !== 'ok') throw new Error(`set leverage failed: ${JSON.stringify(r)}`);
+  return r;
 }
 
 export async function placeMarketOrder(
@@ -101,22 +86,12 @@ export async function placeMarketOrder(
   const mids = await getAllMids();
   const mid = parseFloat(mids[coin]);
   if (!mid) throw new Error(`No mid price for ${coin}`);
-  const szDec = await szDecimalsFor(coin);
-
+  const { index, szDecimals } = await assetInfo(coin);
   const rawPx = isBuy ? mid * (1 + slippagePct) : mid * (1 - slippagePct);
-
-  const s = getSdk();
-  return s.exchange.placeOrder({
-    coin: toSdkCoin(coin),
-    is_buy: isBuy,
-    sz: parseFloat(size),
-    limit_px: formatPx(rawPx, szDec),
-    order_type: { limit: { tif: 'Ioc' } },
-    reduce_only: reduceOnly,
-    grouping: 'na',
-    ...(cloid ? { cloid } : {}),
-    ...(useBuilder ? { builder: INVO_BUILDER } : {}),
-  } as any);
+  return ex.placeOrder({
+    asset: index, isBuy, sz: parseFloat(size), limitPx: formatPx(rawPx, szDecimals),
+    reduceOnly, orderType: { limit: { tif: 'Ioc' } }, cloid,
+  }, useBuilder ? INVO_BUILDER : undefined);
 }
 
 /**
@@ -124,26 +99,21 @@ export async function placeMarketOrder(
  * so it protects the position even when this program or the computer is offline.
  */
 export async function placeStopLoss(coin: string, isLong: boolean, size: number, triggerPx: number) {
-  const szDec = await szDecimalsFor(coin);
-  const trig = formatPx(triggerPx, szDec);
+  const { index, szDecimals } = await assetInfo(coin);
+  const trig = formatPx(triggerPx, szDecimals);
   // Worst acceptable fill once triggered: 10% beyond the trigger
-  const limit = formatPx(isLong ? trig * 0.9 : trig * 1.1, szDec);
-  const s = getSdk();
-  return s.exchange.placeOrder({
-    coin: toSdkCoin(coin),
-    is_buy: !isLong,
-    sz: size,
-    limit_px: limit,
-    order_type: { trigger: { triggerPx: trig, isMarket: true, tpsl: 'sl' } },
-    reduce_only: true,
-  } as any);
+  const limit = formatPx(isLong ? trig * 0.9 : trig * 1.1, szDecimals);
+  return ex.placeOrder({
+    asset: index, isBuy: !isLong, sz: size, limitPx: limit, reduceOnly: true,
+    orderType: { trigger: { triggerPx: trig, isMarket: true, tpsl: 'sl' } },
+  }, useBuilder ? INVO_BUILDER : undefined);
 }
 
 export async function cancelOrdersForCoin(coin: string, wallet: string) {
   const orders = (await getOpenOrders(wallet)).filter(o => o.coin === coin);
   if (orders.length === 0) return null;
-  const s = getSdk();
-  return s.exchange.cancelOrder(orders.map(o => ({ coin: toSdkCoin(coin), o: o.oid })));
+  const { index } = await assetInfo(coin);
+  return ex.cancel(orders.map(o => ({ asset: index, oid: o.oid })));
 }
 
 export async function closePosition(coin: string, wallet: string, cloid?: string) {
