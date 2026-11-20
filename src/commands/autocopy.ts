@@ -184,7 +184,14 @@ async function handleOpen(sig: Signal): Promise<'retry' | void> {
     }
     log('INFO', `${tag}: price is ${drift >= 0 ? drift.toFixed(2) + '% past' : Math.abs(drift).toFixed(2) + '% better than'} their entry ${sig.entryPrice} - copying`);
   }
-  const size = hl.formatSz((margin * lev) / mid, asset.szDecimals);
+  let size = hl.formatSz((margin * lev) / mid, asset.szDecimals);
+  // Rounding down can push coins with big size steps (e.g. ZEC) under the $10 minimum:
+  // go up one step if that stays within ~10% of the intended margin.
+  if (size * mid < 10) {
+    const step = 1 / 10 ** asset.szDecimals;
+    const up = Number((size + step).toFixed(asset.szDecimals));
+    if (up * mid >= 10 && (up * mid) / lev <= margin * 1.1) size = up;
+  }
   if (size * mid < 10) return log('WARN', `skip ${tag}: order $${(size * mid).toFixed(2)} below Hyperliquid's $10 minimum (raise margin or leverage)`);
 
   const isLong = sig.side === 'long';
@@ -361,6 +368,26 @@ async function main() {
     }
   }
 
+  // Invo's notification list only ever returns its newest item, so it is polled every second
+  // (between the slower 5-second cycles) to avoid missing a trade that is quickly followed by another.
+  async function pollNotifications() {
+    const notes: any[] = ((await invo.getNotifications(1, 20)).items ?? []).slice().reverse();
+    for (const n of notes) {
+      if (!n?.id || seenNotifications.has(n.id)) continue;
+      seenNotifications.add(n.id);
+      if (n.notificationType !== 'user_added_investment' || !n.postId) continue;
+      try {
+        const post = (await invo.getPostById(n.postId))?.post;
+        const sig = parseSignal(post);
+        if (!sig) { log('INFO', `@${n.notifier?.username} opened ${n.ticker}: not a verified trade - ignoring`); continue; }
+        await consider(sig, 'notification');
+      } catch (e: any) {
+        seenNotifications.delete(n.id); // retry next poll
+        log('WARN', `could not load @${n.notifier?.username}'s ${n.ticker} trade: ${e.message}`);
+      }
+    }
+  }
+
   while (true) {
     try {
       // 0) Re-check trades waiting for a better price
@@ -373,21 +400,7 @@ async function main() {
       }
 
       // 1) Notifications: instant, and include trades posted without a caption (hidden "shadow" posts)
-      const notes: any[] = ((await invo.getNotifications(1, 20)).items ?? []).slice().reverse();
-      for (const n of notes) {
-        if (!n?.id || seenNotifications.has(n.id)) continue;
-        seenNotifications.add(n.id);
-        if (n.notificationType !== 'user_added_investment' || !n.postId) continue;
-        try {
-          const post = (await invo.getPostById(n.postId))?.post;
-          const sig = parseSignal(post);
-          if (!sig) { log('INFO', `@${n.notifier?.username} opened ${n.ticker}: not a verified trade - ignoring`); continue; }
-          await consider(sig, 'notification');
-        } catch (e: any) {
-          seenNotifications.delete(n.id); // retry next poll
-          log('WARN', `could not load @${n.notifier?.username}'s ${n.ticker} trade: ${e.message}`);
-        }
-      }
+      await pollNotifications();
 
       // 2) Following feed: backup source
       const feed = await invo.getFeed('following', null, 30);
@@ -410,7 +423,12 @@ async function main() {
       log('ERROR', `loop error (${failures} in a row): ${e.message}`);
       if (failures >= 5) await new Promise(r => setTimeout(r, 60_000)); // back off
     }
-    await new Promise(r => setTimeout(r, cfg.pollSeconds * 1000));
+    const until = Date.now() + cfg.pollSeconds * 1000;
+    while (Date.now() < until - 1000) {
+      await new Promise(r => setTimeout(r, 1000));
+      try { await pollNotifications(); } catch { /* the main cycle reports persistent errors */ }
+    }
+    await new Promise(r => setTimeout(r, Math.max(0, until - Date.now())));
   }
 }
 
