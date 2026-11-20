@@ -155,6 +155,8 @@ async function handleOpen(sig: Signal) {
   const lev = Math.max(1, Math.min(sig.leverage, cfg.maxLeverage, asset.maxLeverage));
 
   const acct = await hl.getAccountState(WALLET_ADDRESS);
+  const existing = (acct.assetPositions ?? []).find((p: any) => p.position?.coin === sig.coin && parseFloat(p.position.szi) !== 0);
+  if (existing) return log('INFO', `skip ${tag}: you already have a ${sig.coin} position this program did not open`);
   const accountValue = parseFloat(acct.marginSummary?.accountValue ?? '0');
   const withdrawable = parseFloat(acct.withdrawable ?? '0');
   const margin = cfg.marginPerTradePct ? accountValue * cfg.marginPerTradePct / 100 : cfg.marginPerTradeUsd;
@@ -205,7 +207,8 @@ async function handleOpen(sig: Signal) {
     if (slPx) {
       const sl = hl.orderOutcome(await hl.placeStopLoss(sig.coin, isLong, out.totalSz!, isLong ? out.avgPx! * (1 - slMove) : out.avgPx! * (1 + slMove)));
       // Trigger orders rest instead of filling, so "resting" is success here
-      if (sl.error && !/resting/i.test(sl.error)) log('ERROR', `stop loss NOT placed for ${sig.coin} - set one manually!`, sl);
+      if (sl.error && !/resting|waitingForTrigger/i.test(sl.error)) log('ERROR', `stop loss NOT placed for ${sig.coin} - set one manually!`, sl);
+      else log('INFO', `stop loss set for ${sig.coin}`);
     }
     log('TRADE', `OPENED copy of ${tag}`, plan);
   }
