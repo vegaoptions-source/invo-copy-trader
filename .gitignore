@@ -11,3 +11,4 @@ copy-config.json
 patches/
 agent-key.json
 autocopy.console.log
+*.log
