@@ -35,6 +35,7 @@ interface Config {
   allowedCoins: string[];         // empty = any
   blockedCoins: string[];
   copyCloses: boolean;
+  maxSignalAgeMinutes: number;    // only copy trades the trader opened within this many minutes
   pollSeconds: number;
   logFile: string;
 }
@@ -53,6 +54,7 @@ const DEFAULTS: Config = {
   allowedCoins: [],
   blockedCoins: [],
   copyCloses: true,
+  maxSignalAgeMinutes: 10,
   pollSeconds: 5,
   logFile: 'autocopy.log',
 };
@@ -80,6 +82,7 @@ interface Held {
   ownerId: string;
   username: string;
   sourceBaseShortId?: string;
+  sourceBaseId?: string;          // source trade id, used to ask Invo whether it is still open
   invoBaseShortId?: string;       // our own Invo position id, needed to record the close
   openedAt: string;
 }
@@ -97,7 +100,7 @@ function log(level: 'INFO' | 'WARN' | 'ERROR' | 'TRADE', msg: string, extra?: un
 
 interface Signal {
   postId: string;
-  action: 'open' | 'close' | 'increase';
+  isOpen: boolean;
   coin: string;
   side: 'long' | 'short';
   leverage: number;
@@ -107,20 +110,16 @@ interface Signal {
   baseId?: string;
   updateId?: string;
   portfolioId?: string;
-  createdAt?: number;
+  openedAt?: number;              // when the trader opened the trade
 }
 
 function parseSignal(post: any): Signal | null {
   const u = post?.update;
-  if (!u?.ticker || !u.verifiedTrade) return null;
-  const isOpen = u.isOpen === true;
-  const isClosed = u.isOpen === false && u.closingPrice != null;
-  const action = isClosed ? 'close' : u.changes?.isAdded !== false ? 'open' : 'increase';
-  if (!isOpen && !isClosed) return null;
-  const created = Date.parse(post.createdAt ?? post.created_at ?? u.createdAt ?? '');
+  if (!u?.ticker || !u.verifiedTrade || !u.baseShortId) return null;
+  const opened = Date.parse(u.createdAt ?? '');
   return {
     postId: post.id,
-    action,
+    isOpen: u.isOpen === true,
     coin: String(u.ticker).toUpperCase(),
     side: u.directionLong ? 'long' : 'short',
     leverage: Number(u.leverage) || 1,
@@ -130,7 +129,7 @@ function parseSignal(post: any): Signal | null {
     baseId: u.baseId,
     updateId: u.id,
     portfolioId: u.portfolio?.id,
-    createdAt: Number.isFinite(created) ? created : undefined,
+    openedAt: Number.isFinite(opened) ? opened : undefined,
   };
 }
 
@@ -213,30 +212,32 @@ async function handleOpen(sig: Signal) {
 
   held[sig.coin] = {
     coin: sig.coin, side: sig.side, size: plan.size, leverage: lev, entryPx: plan.approxPx,
-    ownerId: sig.ownerId, username: sig.username, sourceBaseShortId: sig.baseShortId, invoBaseShortId,
+    ownerId: sig.ownerId, username: sig.username, sourceBaseShortId: sig.baseShortId, sourceBaseId: sig.baseId, invoBaseShortId,
     openedAt: new Date().toISOString(),
   };
   saveState();
 }
 
-async function handleClose(sig: Signal) {
-  const h = held[sig.coin];
-  if (!h || h.ownerId !== sig.ownerId) return; // not a trade we copied
-  if (!cfg.copyCloses) return log('INFO', `@${sig.username} closed ${sig.coin}; copyCloses is off, keeping position`);
+async function closeHeld(coin: string, reason: string) {
+  const h = held[coin];
+  if (!h) return;
+  if (!cfg.copyCloses) return log('INFO', `${reason}; copyCloses is off, keeping ${coin}`);
 
   if (cfg.dryRun) {
-    log('TRADE', `would CLOSE ${sig.coin} (@${sig.username} closed)`);
+    log('TRADE', `would CLOSE ${coin} (${reason})`);
   } else {
     try {
       const tx = cfg.mode === 'invo' ? newInvoTx('close') : undefined;
       const nonceMs = Date.now();
-      const resp = await hl.closePosition(sig.coin, WALLET_ADDRESS, tx?.cloid);
+      const resp = await hl.closePosition(coin, WALLET_ADDRESS, tx?.cloid);
       const out = hl.orderOutcome(resp);
-      if (!out.filled) return log('ERROR', `close failed for ${sig.coin} - will retry next signal/reconcile`, out);
-      log('TRADE', `CLOSED ${sig.coin} (@${sig.username} closed)`, out);
-      if (tx && cfg.recordOnInvo && h.invoBaseShortId) {
+      if (!out.filled) return log('ERROR', `close failed for ${coin} - will retry`, out);
+      log('TRADE', `CLOSED ${coin} (${reason})`, out);
+      // Invo records a mimic close against the SOURCE trade's baseShortId (seen in the web app)
+      const invoId = h.invoBaseShortId ?? h.sourceBaseShortId;
+      if (tx && cfg.recordOnInvo && invoId) {
         await invo.recordClose({
-          clientTxId: tx.clientTxId, baseShortId: h.invoBaseShortId, assetIndex: [...meta.keys()].indexOf(sig.coin),
+          clientTxId: tx.clientTxId, baseShortId: invoId, assetIndex: [...meta.keys()].indexOf(coin),
           submission: { hlOrder: resp, nonceMs, hlResponse: resp },
           summary: { qtyBefore: String(h.side === 'long' ? h.size : -h.size), qtyAfter: '0' },
         }).then(r => log('INFO', 'recorded close on Invo', r?.data ?? r))
@@ -244,12 +245,28 @@ async function handleClose(sig: Signal) {
       }
     } catch (e: any) {
       if (!/No open position/.test(e.message)) throw e;
-      log('INFO', `${sig.coin} already closed on exchange`);
+      log('INFO', `${coin} already closed on exchange`);
     }
-    await hl.cancelOrdersForCoin(sig.coin, WALLET_ADDRESS).catch(() => null);
+    await hl.cancelOrdersForCoin(coin, WALLET_ADDRESS).catch(() => null);
   }
-  delete held[sig.coin];
+  delete held[coin];
   saveState();
+}
+
+/** Ask Invo whether each copied trade is still open on the trader's side. */
+async function checkSourceTrades() {
+  for (const h of Object.values(held)) {
+    if (!h.sourceBaseId) continue;
+    try {
+      const r = await invo.getInvestmentStatus(h.sourceBaseId);
+      const st = r?.status;
+      if (st && (st.isOpen === false || st.exists === false)) {
+        await closeHeld(h.coin, `@${h.username} closed their ${h.coin} trade`);
+      }
+    } catch (e: any) {
+      log('WARN', `could not check @${h.username}'s ${h.coin} trade: ${e.message}`);
+    }
+  }
 }
 
 /** Drop positions that disappeared on the exchange (stop loss hit, liquidated, closed by hand). */
@@ -289,7 +306,9 @@ async function main() {
 
   log('INFO', 'autocopy started', { config: configPath, ...cfg, holding: Object.keys(held) });
 
-  const seen = new Set<string>();
+  const replay = process.env.AUTOCOPY_REPLAY === '1' && cfg.dryRun;
+  if (replay) log('INFO', 'REPLAY: treating open trades already in the feed as new (dry run preview)');
+  const knownTrades = new Set<string>();
   let first = true;
   let loops = 0;
   let failures = 0;
@@ -299,34 +318,28 @@ async function main() {
       const feed = await invo.getFeed('following', null, 30);
       const posts: any[] = (feed.items ?? []).slice().reverse(); // oldest first
       for (const post of posts) {
-        if (!post?.id || seen.has(post.id)) continue;
-        seen.add(post.id);
         const sig = parseSignal(post);
-        if (!sig) continue;
+        if (!sig || knownTrades.has(sig.baseShortId!)) continue;
+        knownTrades.add(sig.baseShortId!);
+        // trades already in the feed at startup are not copied (AUTOCOPY_REPLAY=1 previews them, dry run only)
+        if (first && !(replay && sig.isOpen)) continue;
 
-        if (first) {
-          // Startup: ignore old opens, but catch closes that happened while we were offline
-          const h = held[sig.coin];
-          if (sig.action === 'close' && h && h.ownerId === sig.ownerId &&
-              (sig.createdAt === undefined || sig.createdAt > Date.parse(h.openedAt))) {
-            log('INFO', `found close for ${sig.coin} that happened while offline`);
-            await handleClose(sig);
-          }
-          continue;
-        }
-
-        log('INFO', `signal: @${sig.username} ${sig.action} ${sig.coin} ${sig.side} ${sig.leverage}x`);
-        if (sig.action === 'open') await handleOpen(sig);
-        else if (sig.action === 'close') await handleClose(sig);
+        const ageMin = replay ? 0 : sig.openedAt ? (Date.now() - sig.openedAt) / 60_000 : Infinity;
+        const desc = `@${sig.username} ${sig.coin} ${sig.side} ${sig.leverage}x`;
+        if (!sig.isOpen) { log('INFO', `seen already-closed trade ${desc} - ignoring`); continue; }
+        if (ageMin > cfg.maxSignalAgeMinutes) { log('INFO', `new post for an older trade ${desc} (opened ${Math.round(ageMin)} min ago) - not copying`); continue; }
+        log('INFO', `NEW TRADE: ${desc} (opened ${ageMin.toFixed(1)} min ago)`);
+        await handleOpen(sig);
       }
-      if (first) log('INFO', `indexed ${seen.size} existing posts; now watching for new signals`);
+      if (first) log('INFO', `indexed ${knownTrades.size} existing trades; now watching for new ones`);
       first = false;
       failures = 0;
 
-      if (++loops % 12 === 0) await reconcile();          // ~every minute
-      if (loops % 720 === 0) await refreshMeta();          // ~every hour
+      await checkSourceTrades();                            // closes copies whose source trade closed (also after downtime)
+      if (++loops % 12 === 0) await reconcile();            // ~every minute
+      if (loops % 720 === 0) await refreshMeta();            // ~every hour
       if (!cfg.dryRun && loops % 4320 === 0) await connectTrading(); // ~every 6h: renews the trading key before expiry
-      if (seen.size > 5000) { const keep = [...seen].slice(-2000); seen.clear(); keep.forEach(k => seen.add(k)); }
+      if (knownTrades.size > 5000) { const keep = [...knownTrades].slice(-2000); knownTrades.clear(); keep.forEach(k => knownTrades.add(k)); }
     } catch (e: any) {
       failures++;
       log('ERROR', `loop error (${failures} in a row): ${e.message}`);
