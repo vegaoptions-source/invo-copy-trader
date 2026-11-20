@@ -65,8 +65,9 @@ async function main() {
       };
 
   // Record on Invo (non-fatal if it fails — position is open on HL regardless)
+  // Only meaningful when trading Invo's own wallet; off by default (RECORD_ON_INVO=true to enable)
   let invoResult: any = null;
-  try {
+  if (process.env.RECORD_ON_INVO === 'true') try {
     invoResult = await invo.recordOpen({
       clientTxId,
       coin,

@@ -32,10 +32,12 @@ async function main() {
   // Close on HL
   const nonceMs = Date.now();
   const closeResult = await hl.closePosition(coin, WALLET_ADDRESS);
+  // Remove the leftover stop-loss for this coin
+  await hl.cancelOrdersForCoin(coin, WALLET_ADDRESS).catch(() => null);
 
   // Record on Invo (best-effort — Invo auto-detects HL closes)
   let invoResult: any = null;
-  if (baseShortId) {
+  if (baseShortId && process.env.RECORD_ON_INVO === 'true') {
     try {
       invoResult = await invo.recordClose({
         clientTxId: randomUUID(),
