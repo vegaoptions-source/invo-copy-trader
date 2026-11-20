@@ -312,29 +312,51 @@ async function main() {
   const replay = process.env.AUTOCOPY_REPLAY === '1' && cfg.dryRun;
   if (replay) log('INFO', 'REPLAY: treating open trades already in the feed as new (dry run preview)');
   const knownTrades = new Set<string>();
+  const seenNotifications = new Set<string>();
   let first = true;
   let loops = 0;
   let failures = 0;
 
+  async function consider(sig: Signal, source: string) {
+    if (knownTrades.has(sig.baseShortId!)) return;
+    knownTrades.add(sig.baseShortId!);
+    // trades already known at startup are not copied (AUTOCOPY_REPLAY=1 previews them, dry run only)
+    if (first && !(replay && sig.isOpen)) return;
+    const ageMin = replay ? 0 : sig.openedAt ? (Date.now() - sig.openedAt) / 60_000 : Infinity;
+    const desc = `@${sig.username} ${sig.coin} ${sig.side} ${sig.leverage}x`;
+    if (!sig.isOpen) return log('INFO', `seen already-closed trade ${desc} - ignoring`);
+    if (ageMin > cfg.maxSignalAgeMinutes) return log('INFO', `new post for an older trade ${desc} (opened ${Math.round(ageMin)} min ago) - not copying`);
+    log('INFO', `NEW TRADE via ${source}: ${desc} (opened ${ageMin.toFixed(1)} min ago)`);
+    await handleOpen(sig);
+  }
+
   while (true) {
     try {
-      const feed = await invo.getFeed('following', null, 30);
-      const posts: any[] = (feed.items ?? []).slice().reverse(); // oldest first
-      for (const post of posts) {
-        const sig = parseSignal(post);
-        if (!sig || knownTrades.has(sig.baseShortId!)) continue;
-        knownTrades.add(sig.baseShortId!);
-        // trades already in the feed at startup are not copied (AUTOCOPY_REPLAY=1 previews them, dry run only)
-        if (first && !(replay && sig.isOpen)) continue;
-
-        const ageMin = replay ? 0 : sig.openedAt ? (Date.now() - sig.openedAt) / 60_000 : Infinity;
-        const desc = `@${sig.username} ${sig.coin} ${sig.side} ${sig.leverage}x`;
-        if (!sig.isOpen) { log('INFO', `seen already-closed trade ${desc} - ignoring`); continue; }
-        if (ageMin > cfg.maxSignalAgeMinutes) { log('INFO', `new post for an older trade ${desc} (opened ${Math.round(ageMin)} min ago) - not copying`); continue; }
-        log('INFO', `NEW TRADE: ${desc} (opened ${ageMin.toFixed(1)} min ago)`);
-        await handleOpen(sig);
+      // 1) Notifications: instant, and include trades posted without a caption (hidden "shadow" posts)
+      const notes: any[] = ((await invo.getNotifications(1, 20)).items ?? []).slice().reverse();
+      for (const n of notes) {
+        if (!n?.id || seenNotifications.has(n.id)) continue;
+        seenNotifications.add(n.id);
+        if (n.notificationType !== 'user_added_investment' || !n.postId) continue;
+        if (first && !replay) continue; // startup: just remember them
+        try {
+          const post = (await invo.getPostById(n.postId))?.post;
+          const sig = parseSignal(post);
+          if (!sig) { log('INFO', `@${n.notifier?.username} opened ${n.ticker}: not a verified trade - ignoring`); continue; }
+          await consider(sig, 'notification');
+        } catch (e: any) {
+          seenNotifications.delete(n.id); // retry next poll
+          log('WARN', `could not load @${n.notifier?.username}'s ${n.ticker} trade: ${e.message}`);
+        }
       }
-      if (first) log('INFO', `indexed ${knownTrades.size} existing trades; now watching for new ones`);
+
+      // 2) Following feed: backup source
+      const feed = await invo.getFeed('following', null, 30);
+      for (const post of (feed.items ?? []).slice().reverse()) {
+        const sig = parseSignal(post);
+        if (sig) await consider(sig, 'feed');
+      }
+      if (first) log('INFO', `indexed ${knownTrades.size} trades and ${seenNotifications.size} notifications; now watching for new ones`);
       first = false;
       failures = 0;
 
@@ -343,6 +365,7 @@ async function main() {
       if (loops % 720 === 0) await refreshMeta();            // ~every hour
       if (!cfg.dryRun && loops % 4320 === 0) await connectTrading(); // ~every 6h: renews the trading key before expiry
       if (knownTrades.size > 5000) { const keep = [...knownTrades].slice(-2000); knownTrades.clear(); keep.forEach(k => knownTrades.add(k)); }
+      if (seenNotifications.size > 5000) { const keep = [...seenNotifications].slice(-2000); seenNotifications.clear(); keep.forEach(k => seenNotifications.add(k)); }
     } catch (e: any) {
       failures++;
       log('ERROR', `loop error (${failures} in a row): ${e.message}`);

@@ -111,6 +111,16 @@ export async function getFeed(filter: string, lastPostId: string | null = null, 
   });
 }
 
+/** Your notifications, newest first. Traders you follow trigger "user_added_investment" within seconds of a trade. */
+export async function getNotifications(page = 1, size = 20) {
+  return post('/v1_0/notifications/get_notifications', { params: { page, size } });
+}
+
+/** A single post, including hidden "shadow_investment" posts that never appear in feeds. */
+export async function getPostById(postId: string) {
+  return post('/v1_0/posts/get_post_by_id', { postId });
+}
+
 // --- Social ---
 
 export async function followUser(userId: string) {
