@@ -401,13 +401,17 @@ async function main() {
 
   while (true) {
     try {
+      // Closes first: copies whose source trade closed (also after downtime)
+      await checkSourceTrades();
+
       // 0) Re-check waiting trades (better price / free margin / free slot) every 3rd cycle (~15 s) to stay under rate limits
       if (loops % 3 === 0) for (const [id, sig] of [...waiting]) {
         const ageMin = sig.openedAt ? (Date.now() - sig.openedAt) / 60_000 : Infinity;
         if (ageMin > cfg.maxSignalAgeMinutes) { waiting.delete(id); saveWaiting(); markHandled(id); log('INFO', `gave up on @${sig.username} ${sig.coin}: still not copyable after ${cfg.maxSignalAgeMinutes} min`); continue; }
         const st = sig.baseId ? (await invo.getInvestmentStatus(sig.baseId).catch(() => null))?.status : null;
         if (st && st.isOpen === false) { waiting.delete(id); saveWaiting(); markHandled(id); log('INFO', `@${sig.username} closed ${sig.coin} while it was waiting - not copying`); continue; }
-        await consider(sig, 'retry');
+        // a failure here (e.g. rate limit) must never block close checks later in the cycle
+        try { await consider(sig, 'retry'); } catch (e: any) { log('WARN', `could not recheck @${sig.username} ${sig.coin}: ${e.message}`); }
       }
 
       // 1) Notifications: instant, and include trades posted without a caption (hidden "shadow" posts)
@@ -423,7 +427,6 @@ async function main() {
       first = false;
       failures = 0;
 
-      await checkSourceTrades();                            // closes copies whose source trade closed (also after downtime)
       if (++loops % 12 === 0) await reconcile();            // ~every minute
       if (loops % 720 === 0) await refreshMeta();            // ~every hour
       if (!cfg.dryRun && loops % 4320 === 0) await connectTrading(); // ~every 6h: renews the trading key before expiry
