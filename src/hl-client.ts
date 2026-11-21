@@ -15,13 +15,17 @@ export async function connect(agentKey: string, _walletAddress: string): Promise
 }
 
 async function info<T = any>(body: object): Promise<T> {
-  const resp = await fetch(INFO_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!resp.ok) throw new Error(`HL info ${JSON.stringify(body)} -> HTTP ${resp.status}`);
-  return (await resp.json()) as T;
+  // Hyperliquid answers 429 when rate-limited: back off briefly and retry instead of failing the cycle
+  for (let attempt = 0; ; attempt++) {
+    const resp = await fetch(INFO_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (resp.status === 429 && attempt < 3) { await new Promise(r => setTimeout(r, 1500 * (attempt + 1))); continue; }
+    if (!resp.ok) throw new Error(`HL info ${JSON.stringify(body)} -> HTTP ${resp.status}`);
+    return (await resp.json()) as T;
+  }
 }
 
 export type AssetMeta = { name: string; szDecimals: number; maxLeverage: number };

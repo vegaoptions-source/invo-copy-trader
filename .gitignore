@@ -13,3 +13,4 @@ agent-key.json
 autocopy.console.log
 *.log
 autocopy-handled*.json
+autocopy-waiting*.json

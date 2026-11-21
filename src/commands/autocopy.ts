@@ -348,7 +348,11 @@ async function main() {
   if (replay) log('INFO', 'REPLAY: treating open trades already in the feed as new (dry run preview)');
   const knownTrades = new Set<string>();
   const seenNotifications = new Set<string>();
-  const waiting = new Map<string, Signal>();   // trades waiting for the price to come back within maxEntryDriftPct
+  // trades waiting for a better price, free margin or a free slot; saved so a restart keeps them
+  const waitingPath = cfg.dryRun ? 'autocopy-waiting.dry.json' : 'autocopy-waiting.json';
+  const waiting = new Map<string, Signal>(existsSync(waitingPath) ? JSON.parse(readFileSync(waitingPath, 'utf8')) : []);
+  const saveWaiting = () => writeFileSync(waitingPath, JSON.stringify([...waiting]));
+  if (waiting.size) log('INFO', `resuming ${waiting.size} waiting trade(s): ${[...waiting.values()].map(w => `@${w.username} ${w.coin}`).join(', ')}`);
   let first = true;
   let loops = 0;
   let failures = 0;
@@ -366,8 +370,8 @@ async function main() {
     if (ageMin > cfg.maxSignalAgeMinutes) return log('INFO', `new post for an older trade ${desc} (opened ${Math.round(ageMin)} min ago) - not copying`);
     if (!driftNoted.has(id) && !capacityNoted.has(id)) log('INFO', `NEW TRADE via ${source}: ${desc} (opened ${ageMin.toFixed(1)} min ago)`);
     try {
-      if ((await handleOpen(sig)) === 'retry') { knownTrades.delete(id); waiting.set(id, sig); return; }
-      waiting.delete(id);
+      if ((await handleOpen(sig)) === 'retry') { knownTrades.delete(id); waiting.set(id, sig); saveWaiting(); return; }
+      if (waiting.delete(id)) saveWaiting();
       markHandled(id);
     } catch (e: any) {
       knownTrades.delete(id); // let the next poll retry while the trade is still fresh
@@ -397,12 +401,12 @@ async function main() {
 
   while (true) {
     try {
-      // 0) Re-check trades waiting for a better price
-      for (const [id, sig] of [...waiting]) {
+      // 0) Re-check waiting trades (better price / free margin / free slot) every 3rd cycle (~15 s) to stay under rate limits
+      if (loops % 3 === 0) for (const [id, sig] of [...waiting]) {
         const ageMin = sig.openedAt ? (Date.now() - sig.openedAt) / 60_000 : Infinity;
-        if (ageMin > cfg.maxSignalAgeMinutes) { waiting.delete(id); markHandled(id); log('INFO', `gave up on @${sig.username} ${sig.coin}: still not copyable after ${cfg.maxSignalAgeMinutes} min`); continue; }
+        if (ageMin > cfg.maxSignalAgeMinutes) { waiting.delete(id); saveWaiting(); markHandled(id); log('INFO', `gave up on @${sig.username} ${sig.coin}: still not copyable after ${cfg.maxSignalAgeMinutes} min`); continue; }
         const st = sig.baseId ? (await invo.getInvestmentStatus(sig.baseId).catch(() => null))?.status : null;
-        if (st && st.isOpen === false) { waiting.delete(id); markHandled(id); log('INFO', `@${sig.username} closed ${sig.coin} while it was waiting - not copying`); continue; }
+        if (st && st.isOpen === false) { waiting.delete(id); saveWaiting(); markHandled(id); log('INFO', `@${sig.username} closed ${sig.coin} while it was waiting - not copying`); continue; }
         await consider(sig, 'retry');
       }
 
