@@ -172,9 +172,11 @@ async function handleOpen(sig: Signal): Promise<'retry' | void> {
   if (existing) return log('INFO', `skip ${tag}: you already have a ${sig.coin} position this program did not open`);
   const accountValue = parseFloat(acct.marginSummary?.accountValue ?? '0');
   const withdrawable = parseFloat(acct.withdrawable ?? '0');
-  const margin = cfg.marginPerTradePct ? accountValue * cfg.marginPerTradePct / 100 : cfg.marginPerTradeUsd;
+  let margin = cfg.marginPerTradePct ? accountValue * cfg.marginPerTradePct / 100 : cfg.marginPerTradeUsd;
+  // Within 10% of the target margin: use what's free (minus a small buffer) instead of missing the trade over cents
+  if (!cfg.dryRun && margin > withdrawable && withdrawable >= margin * 0.9) margin = Math.floor(withdrawable * 0.98 * 100) / 100;
   if (!cfg.dryRun && margin > withdrawable) {
-    if (!capacityNoted.has(sig.baseShortId!)) { capacityNoted.add(sig.baseShortId!); log('WARN', `waiting on ${tag}: need $${margin.toFixed(2)} margin, only $${withdrawable.toFixed(2)} available - will copy if margin frees up`); }
+    if (!capacityNoted.has(sig.baseShortId!)) { capacityNoted.add(sig.baseShortId!); log('WARN', `waiting on ${tag}: need $${margin.toFixed(2)} margin, only $${withdrawable.toFixed(3)} available - will copy if margin frees up`); }
     return 'retry';
   }
 
